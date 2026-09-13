@@ -510,7 +510,9 @@ see the tools until it is restarted.
 
 ## 14. What an image needs to be Apple `container` machine friendly
 
-Nothing on Docker Hub targets `container machine` (searched 2026-09-13). Stock
+Nothing on Docker Hub targets `container machine` (searched 2026-09-13); the
+one Debian machine image found elsewhere, `ghcr.io/mikluko/machine-debian`,
+ships a fixed machine-id in its files. Stock
 Debian, Ubuntu, Fedora and Rocky images have no `/sbin/init` and cannot boot.
 A handful of images do boot — stock `alpine:3.22` and `almalinux:9`, plus
 several systemd images — but each fails at least one item below; four of them

@@ -8,7 +8,10 @@ was booted as a real machine (`container machine create <image> --cpus 1
 
 - **Nothing on Docker Hub is built for Apple `container` machines.** Searches
   for "apple container", "container machine", "systemd debian", "init image"
-  and similar return nothing aimed at it.
+  and similar return nothing aimed at it. Outside Docker Hub there is one
+  published Debian 13 machine image, `ghcr.io/mikluko/machine-debian`, plus
+  several GitHub repos with Dockerfiles to build yourself
+  ([below](#built-for-machines-inspected-not-booted)).
 - **Stock Debian, Ubuntu, Fedora and Rocky Linux images cannot boot as
   machines.** They have no `/sbin/init`.
 - **Some images do boot:** stock `alpine:3.22` and `almalinux:9`, plus several
@@ -21,7 +24,8 @@ was booted as a real machine (`container machine create <image> --cpus 1
   - basic tools present
   - `sudo` installed
 
-  For Debian, build from the official image
+  The GHCR image above has the same problem: its files carry a fixed
+  machine-id. For Debian, build from the official image
   ([bootstrap guide](bootstrap-debian-machine.md)) or use
   `xbill9/debian13-machine:latest`.
 
@@ -115,11 +119,37 @@ Other things seen:
 - **Boot time:** the RHEL-family init images and this repo's image were ready in
   about 4 s; the others took about 15 s.
 
+## Built for machines, inspected, not booted
+
+Found 2026-09-13 by searching GitHub and Docker Hub. The published images were
+pulled as `linux/arm64` on a Linux host and their files read (`docker create`
++ `docker cp`); none has been booted as a machine yet.
+
+| Image | What it is | Files in the image |
+|---|---|---|
+| `ghcr.io/mikluko/machine-debian:latest` ([repo](https://github.com/mikluko/machine-debian)) | Debian 13 base "for Apple `container` machines": systemd, `sudo`, Git, Go, Node. arm64 only, rebuilt by CI on each new `trixie-YYYYMMDD` snapshot | `/etc/machine-id` and `/var/lib/dbus/machine-id` both `5a17ac3825b34018b91a6c37515e7cec`; the Dockerfile never clears them. `systemd-modules-load` is not masked |
+| `techsk8/systemd-debian13:latest` (Docker Hub) | Debian 13 systemd image, amd64 + arm64, not aimed at machines | `/etc/machine-id` = `26892d1c9c234fbe8c0b3d83c74a4e9d`; `/sbin/init` not confirmed |
+
+Going by the boot tests above (the ID stored in the image is the ID of the
+booted machine), every machine from either image would share one machine-id.
+That is expected, not observed.
+
+Dockerfiles for machines, with no published image:
+
+| Repo | Base |
+|---|---|
+| [`ngwese/container-machine-images`](https://github.com/ngwese/container-machine-images) | `debian:trixie-slim` + systemd, sshd, sudo; empties both machine-id files and masks several units |
+| [`tcorbettclark/devbox`](https://github.com/tcorbettclark/devbox) | Debian stable-slim + systemd, passwordless sudo, SSH |
+| `jgpruitt/devbox`, `rsinghal-aka/containermachines`, `yahonda/rails-dev-box-container` | Ubuntu |
+| `sokoloowski/container-machine-images` | Fedora, Rocky Linux, Ubuntu |
+| `BerndAmend/archlinux-aarch64-container`, `aca/container-machine-nixos`, `johejo/nixos-apple-container-machine` | Arch Linux, NixOS |
+
 ## Not tested
 
 | Image | Why |
 |---|---|
 | `jrei/systemd-debian`, `jrei/systemd-ubuntu` | amd64 only; no arm64 variant |
+| `trfore/docker-debian13-systemd`, `minimum2scp/systemd-trixie` | amd64 only; no arm64 variant |
 | `nggit/systemd-debian` | arm64, but last updated 2023 and stops at bookworm (Debian 12) |
 | `kindest/node` | A ~1 GB Kubernetes-in-Docker node image, not a general OS |
 | `geerlingguy/docker-debian12-ansible`, `docker-rockylinux9-ansible`, `redhat/ubi10-init`, `almalinux/10-init` | Same families as images tested above |
@@ -149,7 +179,8 @@ Which to pick:
 
 - **Debian 13:** build from the official `debian:13`
   ([bootstrap guide](bootstrap-debian-machine.md)), or pull
-  `xbill9/debian13-machine:latest`.
+  `xbill9/debian13-machine:latest`. For a Go/Node baseline,
+  `ghcr.io/mikluko/machine-debian` needs the machine-id fix above.
 - **RHEL-family:** `almalinux/9-init` or `redhat/ubi9-init` boot cleanly with a
   unique ID. Add `sudo` and `less` if you want them.
 - **Smallest:** `alpine:3.22` boots in seconds, but has no systemd.

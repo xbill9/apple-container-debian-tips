@@ -30,9 +30,9 @@ fix is a small image on top of `debian:13` that adds an init system and
 handles three smaller problems. Details are in
 [README section 14](../README.md#14-what-an-image-needs-to-be-apple-container-machine-friendly).
 
-Other Docker Hub images do boot as machines, but none is a clean Debian 13
+Other published images do boot as machines, but none found is a clean Debian 13
 machine. See [docker-hub-images.md](docker-hub-images.md) for boot tests of
-nine of them.
+nine of them and a list of other machine images and Dockerfiles.
 
 ## 0. Prerequisites
 
