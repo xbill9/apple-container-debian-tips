@@ -1,0 +1,14 @@
+FROM debian:13
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        systemd-sysv \
+        dbus \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# dbus writes a real /var/lib/dbus/machine-id at build time, and systemd copies
+# it into an empty /etc/machine-id at boot — every machine would share one ID.
+RUN : > /etc/machine-id && rm -f /var/lib/dbus/machine-id
+
+CMD ["/sbin/init"]

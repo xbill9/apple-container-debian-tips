@@ -1,0 +1,434 @@
+#!/usr/bin/env bash
+#
+# mkdebian-machine — Debian images for Apple `container` machines, two ways:
+#
+#   new      From nothing: build a machine-bootable Debian image, create a
+#            machine from it, and customize it (packages, a setup script).
+#   publish  From something that already works: snapshot a machine or a
+#            container into an image and push it to a registry (Docker Hub).
+#
+# Plain Debian container images have no /sbin/init, so `container machine
+# create debian:13` produces a machine that never boots:
+#     /sbin.machine/init: exec: /sbin/init: not found
+# `new` installs systemd-sysv (which provides /sbin/init), adds the basic
+# tools Debian images omit, and verifies the result before you rely on it.
+
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+mkdebian-machine — Debian images for Apple container machines
+
+USAGE:
+    mkdebian-machine new [OPTIONS]              fresh image + machine, customized
+    mkdebian-machine publish <name> <ref> [OPTIONS]
+                                                snapshot a working machine or
+                                                container and push it
+    (with no subcommand, `new` is assumed)
+
+NEW OPTIONS:
+    -d, --debian <ver>      Debian version (default: 13)
+    -t, --tag <tag>         Image tag (default: debian<ver>-machine)
+    -p, --packages "<list>" Extra apt packages, baked into the image
+    -m, --machine <name>    Also create a machine with this name
+        --cpus <n>          CPUs for the machine (default: 2)
+        --memory <size>     Memory for the machine (default: 2G)
+        --setup <file>      Shell script run as root inside the new machine
+                            after it boots (needs -m)
+        --sudo-uid <uid>    Grant passwordless sudo to this host uid (see below)
+        --push <ref>        Push the built image, e.g. docker.io/you/debian-machine:13
+        --keep              Keep the generated build directory
+
+PUBLISH ARGUMENTS AND OPTIONS:
+    <name>                  A machine (`container machine ls`) or a container
+                            (`container ls -a`) to snapshot
+    <ref>                   Image reference, e.g. docker.io/you/debian-machine:13
+        --no-push           Build and tag the snapshot image only
+        --scheme <http|https>
+                            Registry scheme (default: https; http for a local
+                            test registry)
+        --keep              Keep the snapshot build directory
+
+EXAMPLES:
+    # From nothing: build, create a machine, customize it
+    mkdebian-machine new -m dev-vm -p "git vim" --setup ./setup-dev.sh
+
+    # Debian 12 with development tools, 4 CPUs
+    mkdebian-machine new -d 12 -p "build-essential git vim" -m build-vm --cpus 4
+
+    # From a working machine you have tuned by hand: publish to Docker Hub
+    container registry login docker.io
+    mkdebian-machine publish dev-vm docker.io/youruser/debian-machine:13
+
+NOTES ON publish:
+    A machine is snapshotted live: it tars its own root disk into a directory
+    under your home folder (machines mount it), so its home mount must be rw.
+    Before building, the image is scrubbed of what `container machine create`
+    added for your host user (the user, its sudoers file, /home/<user>), the
+    machine-id, apt lists, logs, shell history and SSH host keys. A container
+    snapshot keeps the container's command, environment and working directory.
+    Images are arm64 only, and Docker Hub repositories are public by default.
+
+NOTES ON sudo:
+    `container machine run` logs you in as your *host* user (uid 501 typically).
+    A machine's first boot already writes /etc/sudoers.d/<user> with
+    NOPASSWD:ALL for that user; Debian images just lack the sudo package, so
+    `-p sudo` is all you need. Or use `container machine run --root`.
+    --sudo-uid also bakes a `#<uid>` rule into the image itself. Rarely needed,
+    and a real reduction in the security of every machine made from the image.
+    Find your uid with `id -u`.
+USAGE
+}
+
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+ok() { printf '\033[32m  ok\033[0m %s\n' "$*"; }
+
+SUBCOMMAND=new
+case "${1:-}" in
+    new|publish) SUBCOMMAND="$1"; shift ;;
+    help)        usage; exit 0 ;;
+esac
+
+KEEP_WORK_DIR=0
+SCHEME=https
+# new
+DEBIAN_VERSION=13
+TAG=""
+EXTRA_PACKAGES=""
+MACHINE_NAME=""
+SETUP_SCRIPT=""
+PUSH_TO=""
+SUDO_UID=""
+CPUS=2
+MEMORY=2G
+# publish
+SOURCE=""
+REF=""
+NO_PUSH=0
+
+need_arg() { [[ $# -ge 2 && -n "$2" ]] || die "$1 needs a value"; }
+
+if [[ $SUBCOMMAND == new ]]; then
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--debian)   need_arg "$@"; DEBIAN_VERSION="$2"; shift 2 ;;
+            -t|--tag)      need_arg "$@"; TAG="$2"; shift 2 ;;
+            -p|--packages) need_arg "$@"; EXTRA_PACKAGES="$2"; shift 2 ;;
+            -m|--machine)  need_arg "$@"; MACHINE_NAME="$2"; shift 2 ;;
+            --cpus)        need_arg "$@"; CPUS="$2"; shift 2 ;;
+            --memory)      need_arg "$@"; MEMORY="$2"; shift 2 ;;
+            --setup)       need_arg "$@"; SETUP_SCRIPT="$2"; shift 2 ;;
+            --sudo-uid)    need_arg "$@"; SUDO_UID="$2"; shift 2 ;;
+            --push)        need_arg "$@"; PUSH_TO="$2"; shift 2 ;;
+            --keep)        KEEP_WORK_DIR=1; shift ;;
+            -h|--help)     usage; exit 0 ;;
+            *)             die "unknown option for new: $1 (try --help)" ;;
+        esac
+    done
+    [[ -n "$TAG" ]] || TAG="debian${DEBIAN_VERSION}-machine"
+    if [[ -n "$SETUP_SCRIPT" ]]; then
+        [[ -n "$MACHINE_NAME" ]] || die "--setup needs -m <machine>"
+        [[ -f "$SETUP_SCRIPT" ]] || die "setup script not found: $SETUP_SCRIPT"
+    fi
+else
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --scheme)   need_arg "$@"; SCHEME="$2"; shift 2 ;;
+            --no-push)  NO_PUSH=1; shift ;;
+            --keep)     KEEP_WORK_DIR=1; shift ;;
+            -h|--help)  usage; exit 0 ;;
+            -*)         die "unknown option for publish: $1 (try --help)" ;;
+            *)
+                if [[ -z "$SOURCE" ]]; then SOURCE="$1"
+                elif [[ -z "$REF" ]]; then REF="$1"
+                else die "unexpected argument: $1"
+                fi
+                shift ;;
+        esac
+    done
+    [[ -n "$SOURCE" && -n "$REF" ]] || die "usage: mkdebian-machine publish <machine|container> <ref>"
+fi
+[[ $SCHEME == http || $SCHEME == https ]] || die "--scheme must be http or https"
+
+command -v container >/dev/null || die "container CLI not found in PATH"
+
+# The work directory lives under $HOME, not $TMPDIR: machines mount the home
+# folder, so this is the one place a machine can write a snapshot or read a
+# setup script that the host can also see. No single quotes allowed, because
+# the path is embedded in commands that `machine run` re-parses with bash -c.
+mkdir -p "$HOME/.cache/mkdebian-machine"
+WORK_DIR="$(mktemp -d "$HOME/.cache/mkdebian-machine/${SUBCOMMAND}.XXXXXX")"
+[[ "$WORK_DIR" != *"'"* ]] || die "home directory path contains a single quote: $WORK_DIR"
+
+STARTED_BUILDER=0
+cleanup() {
+    if [[ $KEEP_WORK_DIR -eq 1 ]]; then
+        info "work directory kept at $WORK_DIR"
+    else
+        rm -rf "$WORK_DIR"
+    fi
+    if [[ $STARTED_BUILDER -eq 1 ]]; then
+        info "stopping builder (it was not running before)"
+        container builder stop >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
+# `container build` needs the buildkit builder. Start it ourselves and track that
+# we did, so we can leave things as we found them — it holds 2 CPUs and 2 GB
+# while running, which matters on a small Mac. (`container build` will also
+# start a stopped builder on its own, but then nothing stops it afterwards.)
+# Note: `container builder status` exits 0 even when the builder is NOT running,
+# so the exit code is useless here — match on the output text instead. On 1.4.1
+# a stopped builder shows STATE `stopped`, not "not running".
+ensure_builder() {
+    if container builder status 2>&1 | grep -Eqi 'not running|stopped'; then
+        info "starting builder"
+        container builder start >/dev/null 2>&1 || die "could not start builder"
+        STARTED_BUILDER=1
+    fi
+}
+
+build_image() {
+    local tag="$1"
+    ensure_builder
+    container build -t "$tag" "$WORK_DIR" 2>&1 | grep -vE '^#[0-9]+ [0-9.]+ debconf:' || true
+    container image ls | awk 'NR>1{print $1 ":" $2}' | grep -qx -e "$tag" -e "${tag}:latest" \
+        || die "build did not produce ${tag} — see the build output above"
+}
+
+# The check that matters. Skipping it is how you end up with a machine that
+# is created, stopped, and unable to ever start.
+verify_init() {
+    local tag="$1" init
+    info "verifying /sbin/init exists"
+    init="$(container run --rm "$tag" sh -c 'readlink -f /sbin/init 2>/dev/null || echo MISSING' 2>/dev/null | tail -1 | tr -d '\r')"
+    [[ "$init" != "MISSING" && -n "$init" ]] \
+        || die "/sbin/init missing from ${tag} — it will not boot as a machine"
+    ok "/sbin/init -> ${init}"
+}
+
+# `container machine create` returns while the VM is still booting, and a
+# `machine run` in that window fails with the misleading TTY error "Operation
+# not supported by device". Poll with a no-op until the machine takes commands.
+wait_for_machine() {
+    local name="$1"
+    for _ in $(seq 1 30); do
+        container machine run -n "$name" --root -- true >/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    die "machine ${name} did not accept commands after 60s — check: container machine logs ${name}"
+}
+
+push_image() {
+    local ref="$1" host="${1%%/*}"
+    # A reference like `youruser/repo` or `repo` has no registry host: Docker Hub.
+    [[ "$ref" == */* && ( "$host" == *.* || "$host" == *:* || "$host" == localhost ) ]] || host=docker.io
+    if [[ $SCHEME == https ]] && ! container registry ls 2>/dev/null | awk 'NR>1{print $1}' | grep -q "$host"; then
+        warn "no saved login matching ${host}; if the push is refused, run: container registry login ${host}"
+    fi
+    # `image push` shows no progress until it finishes: ~70 MB took over 10 minutes on Wi-Fi.
+    info "pushing ${ref} (arm64 only; can take minutes with no progress output)"
+    container image push --scheme "$SCHEME" --progress plain "$ref" \
+        || die "push failed — check the login (container registry login ${host}) and that the repository name matches your account"
+    ok "pushed ${ref}"
+}
+
+# ---------------------------------------------------------------------------
+# new: from nothing
+# ---------------------------------------------------------------------------
+cmd_new() {
+    local all_packages="systemd-sysv dbus ca-certificates procps less iproute2 iputils-ping curl"
+    [[ -n "$EXTRA_PACKAGES" ]] && all_packages="$all_packages $EXTRA_PACKAGES"
+
+    if [[ -n "$MACHINE_NAME" ]] && container machine ls 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$MACHINE_NAME"; then
+        die "machine '${MACHINE_NAME}' already exists (delete it with: container machine delete ${MACHINE_NAME})"
+    fi
+
+    {
+        echo "FROM debian:${DEBIAN_VERSION}"
+        echo
+        echo "ENV DEBIAN_FRONTEND=noninteractive"
+        echo
+        echo "RUN apt-get update \\"
+        echo "    && apt-get install -y --no-install-recommends \\"
+        for pkg in $all_packages; do
+            echo "        ${pkg} \\"
+        done
+        echo "    && rm -rf /var/lib/apt/lists/*"
+        echo
+        echo "# Apple supplies a prebuilt kernel with no matching modules on disk, so"
+        echo "# this unit always fails and leaves systemd reporting 'degraded'."
+        echo "RUN systemctl mask systemd-modules-load.service"
+        echo
+        echo "# Every machine needs its own machine-id. Installing dbus writes a real"
+        echo "# /var/lib/dbus/machine-id, and systemd copies it into an empty /etc/machine-id"
+        echo "# at boot — so without this, every machine from the image shares one ID."
+        echo "RUN : > /etc/machine-id && rm -f /var/lib/dbus/machine-id"
+
+        if [[ -n "$SUDO_UID" ]]; then
+            echo
+            echo "# Passwordless sudo for the host uid that 'machine run' maps in."
+            echo "# sudo's #uid syntax matches by number, since the username may differ."
+            echo "RUN apt-get update && apt-get install -y --no-install-recommends sudo \\"
+            echo "    && rm -rf /var/lib/apt/lists/* \\"
+            echo "    && echo '#${SUDO_UID} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-host-user \\"
+            echo "    && chmod 0440 /etc/sudoers.d/99-host-user"
+        fi
+
+        echo
+        echo '# A machine boots this; a plain container image would not have it.'
+        echo 'CMD ["/sbin/init"]'
+    } > "$WORK_DIR/Dockerfile"
+
+    info "building ${TAG} from debian:${DEBIAN_VERSION}"
+    echo "    packages: $all_packages"
+    build_image "$TAG"
+    verify_init "$TAG"
+
+    if [[ -n "$MACHINE_NAME" ]]; then
+        info "creating machine ${MACHINE_NAME} (cpus=${CPUS} memory=${MEMORY})"
+        container machine create "$TAG" --name "$MACHINE_NAME" --cpus "$CPUS" --memory "$MEMORY"
+        wait_for_machine "$MACHINE_NAME"
+
+        if [[ -n "$SETUP_SCRIPT" ]]; then
+            cp "$SETUP_SCRIPT" "$WORK_DIR/setup.sh"
+            info "customizing ${MACHINE_NAME} with ${SETUP_SCRIPT}"
+            # One argument: `machine run` joins its args and re-parses them with bash -c.
+            container machine run -n "$MACHINE_NAME" --root -e DEBIAN_FRONTEND=noninteractive \
+                -- "bash '$WORK_DIR/setup.sh'" \
+                || die "setup script failed inside ${MACHINE_NAME} (the machine is kept for debugging)"
+            ok "setup script finished"
+        fi
+
+        ok "machine ${MACHINE_NAME} ready"
+        echo
+        echo "    shell as you:   container machine run -n ${MACHINE_NAME}"
+        echo "    shell as root:  container machine run -n ${MACHINE_NAME} --root"
+        echo "    publish later:  mkdebian-machine publish ${MACHINE_NAME} docker.io/<you>/<repo>:<tag>"
+    fi
+
+    if [[ -n "$PUSH_TO" ]]; then
+        info "tagging ${TAG} as ${PUSH_TO}"
+        container image tag "$TAG" "$PUSH_TO"
+        push_image "$PUSH_TO"
+    fi
+
+    echo
+    ok "done — image: ${TAG}"
+}
+
+# ---------------------------------------------------------------------------
+# publish: from a working machine or container
+# ---------------------------------------------------------------------------
+snapshot_machine() {
+    local inspect user uid home_mount
+    command -v jq >/dev/null || die "jq is required to publish a machine"
+    inspect="$(container machine inspect "$SOURCE")"
+    user="$(jq -r '.[0].userSetup.username // empty' <<<"$inspect")"
+    uid="$(jq -r '.[0].userSetup.uid // empty' <<<"$inspect")"
+    home_mount="$(jq -r '.[0].homeMount // empty' <<<"$inspect")"
+    [[ "$home_mount" == rw ]] \
+        || die "machine ${SOURCE} has home-mount=${home_mount:-unknown}; the snapshot is written through it. Run: container machine set -n ${SOURCE} home-mount=rw, then restart it"
+
+    wait_for_machine "$SOURCE"
+    info "snapshotting machine ${SOURCE} (live, root disk only)"
+    # Only the machine's own ext4 root is wanted: --one-file-system drops the
+    # virtiofs home mount and /sbin.machine. The pseudo-filesystem mountpoints are
+    # excluded as whole directories (excluding just their contents still makes tar
+    # stat /sys and report "file changed as we read it") and recreated in the image.
+    # /etc/.machine.initialized is a per-machine mount too, so it is left out.
+    # (First-boot user setup runs only when `id <user>` fails, which is why the
+    # scrub below removes the host user.)
+    local rc=0
+    container machine run -n "$SOURCE" --root -- "tar --one-file-system --numeric-owner --acls --xattrs \
+        -cpf '$WORK_DIR/rootfs.tar' -C / \
+        --exclude=./proc --exclude=./sys --exclude=./dev --exclude=./run --exclude=./tmp \
+        --exclude=./Users --exclude=./sbin.machine --exclude=./etc/.machine.initialized \
+        --exclude=./var/host-services ." || rc=$?
+    # GNU tar exits 1 when a file changed while it was read — normal for a live
+    # system (logs, journals). Anything else is a real failure.
+    case $rc in
+        0) ;;
+        1) warn "some files changed during the live snapshot; stop busy services first for a clean copy" ;;
+        *) die "tar failed inside ${SOURCE} (exit ${rc})" ;;
+    esac
+    [[ -s "$WORK_DIR/rootfs.tar" ]] || die "snapshot is empty: $WORK_DIR/rootfs.tar"
+    ok "rootfs.tar $(du -h "$WORK_DIR/rootfs.tar" | cut -f1)"
+
+    cat > "$WORK_DIR/Dockerfile" <<DOCKERFILE
+FROM scratch
+ADD rootfs.tar /
+
+# Mountpoints the snapshot skipped; the kernel and systemd mount over them at boot.
+RUN mkdir -p /proc /sys /dev /run /tmp && chmod 1777 /tmp
+
+# Scrub what is specific to this Mac or this machine instance, so the image is
+# safe to publish and a new machine sets itself up cleanly.
+RUN if [ -n "${user}" ] && [ "\$(id -u '${user}' 2>/dev/null)" = "${uid}" ]; then \\
+        userdel -r '${user}' 2>/dev/null || true; \\
+        rm -rf '/home/${user}' '/etc/sudoers.d/${user}'; \\
+    fi \\
+    && : > /etc/machine-id && rm -f /var/lib/dbus/machine-id \\
+    && rm -f /etc/ssh/ssh_host_* /root/.bash_history /root/.lesshst \\
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/*.bin /tmp/* /var/tmp/* \\
+    && find /var/log -type f -exec truncate -s 0 {} +
+
+CMD ["/sbin/init"]
+DOCKERFILE
+}
+
+snapshot_container() {
+    local init
+    command -v jq >/dev/null || die "jq is required to publish a container"
+    init="$(container inspect "$SOURCE" | jq '.[0].configuration.initProcess')"
+
+    info "exporting container ${SOURCE}"
+    container export "$SOURCE" -o "$WORK_DIR/rootfs.tar"
+    [[ -s "$WORK_DIR/rootfs.tar" ]] || die "export is empty: $WORK_DIR/rootfs.tar"
+    ok "rootfs.tar $(du -h "$WORK_DIR/rootfs.tar" | cut -f1)"
+
+    # `container export` keeps only the filesystem; carry the process config
+    # over so the image starts the same way the container did.
+    {
+        echo "FROM scratch"
+        echo "ADD rootfs.tar /"
+        # ENV values are JSON-quoted, with \$ escaped so the builder does not expand them.
+        jq -r '.environment[]? | "ENV " + (split("=")[0]) + "=" + (sub("^[^=]*="; "") | @json | gsub("\\$"; "\\$"))' <<<"$init"
+        jq -r '.workingDirectory // empty | "WORKDIR " + .' <<<"$init"
+        jq -c '"CMD " + ([.executable] + (.arguments // []) | tojson)' <<<"$init" | jq -r .
+    } > "$WORK_DIR/Dockerfile"
+}
+
+cmd_publish() {
+    local kind
+    if container machine inspect "$SOURCE" >/dev/null 2>&1; then
+        kind=machine
+        snapshot_machine
+    elif container inspect "$SOURCE" >/dev/null 2>&1; then
+        kind=container
+        snapshot_container
+    else
+        die "no machine or container named ${SOURCE}"
+    fi
+
+    info "building ${REF} from the ${kind} snapshot"
+    build_image "$REF"
+    [[ $kind == machine ]] && verify_init "$REF"
+
+    if [[ $NO_PUSH -eq 1 ]]; then
+        ok "built ${REF} (not pushed: --no-push)"
+    else
+        push_image "$REF"
+    fi
+
+    echo
+    ok "done — image: ${REF}"
+    if [[ $kind == machine ]]; then
+        echo "    create a machine from it:  container machine create ${REF} --name <name>"
+    fi
+}
+
+"cmd_${SUBCOMMAND}"
