@@ -510,10 +510,13 @@ see the tools until it is restarted.
 
 ## 14. What an image needs to be Apple `container` machine friendly
 
-Nothing on Docker Hub targets `container machine` (searched 2026-09-13). Plain
-distro images fail to boot, and the popular systemd images
-(`jrei/systemd-debian`, `jrei/systemd-ubuntu`) are amd64-only. This is the
-checklist, from what 1.4.1 does at boot and from what broke while testing here.
+Nothing on Docker Hub targets `container machine` (searched 2026-09-13). Stock
+Debian, Ubuntu, Fedora and Rocky images have no `/sbin/init` and cannot boot.
+A handful of images do boot — stock `alpine:3.22` and `almalinux:9`, plus
+several systemd images — but each fails at least one item below; four of them
+give every machine the same machine-id. Boot-tested in
+[docs/docker-hub-images.md](docs/docker-hub-images.md). This is the checklist,
+from what 1.4.1 does at boot and from what broke while testing here.
 `mkdebian-machine new` applies all of it.
 
 ### What a machine does with your image

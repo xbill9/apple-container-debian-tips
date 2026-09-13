@@ -30,6 +30,10 @@ fix is a small image on top of `debian:13` that adds an init system and
 handles three smaller problems. Details are in
 [README section 14](../README.md#14-what-an-image-needs-to-be-apple-container-machine-friendly).
 
+Other Docker Hub images do boot as machines, but none is a clean Debian 13
+machine. See [docker-hub-images.md](docker-hub-images.md) for boot tests of
+nine of them.
+
 ## 0. Prerequisites
 
 `container` is installed (README section 1) and its services are running:
