@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+#
+# test-vm-ollama — end-to-end test that an Apple `container` machine can use the
+# Ollama server running on the Mac, and so the Mac's GPU.
+#
+# A Linux VM gets no GPU. Ollama runs on macOS (Metal) and the VM calls it over
+# the VM network, where the Mac is 192.168.64.1. See README section 15.
+
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+test-vm-ollama — test a machine -> Mac Ollama round trip
+
+USAGE:
+    test-vm-ollama [OPTIONS]
+
+OPTIONS:
+    -n, --machine <name>     Machine to test from (default: debian13-vm)
+    -u, --url <url>          Ollama URL as seen from the VM
+                             (default: http://192.168.64.1:8000)
+    -m, --model <model>      Model for the main checks (default: gemma4:e2b)
+    -q, --qat-model <model>  Second model to try (default: gemma4:e2b-it-qat)
+        --no-qat             Skip the second model
+    -h, --help               Show this help
+
+CHECKS (run from inside the machine, except the GPU check):
+    1. the VM reaches Ollama (HTTP 200)
+    2. the model is listed by the OpenAI-compatible /v1/models
+    3. native /api/generate returns text (thinking off)
+    4. streaming delivers incremental chunks
+    5. OpenAI-compatible /v1/chat/completions returns text
+    6. the model is loaded 100% on the GPU (asked from the Mac via /api/ps)
+    7. the second model answers and runs 100% on the GPU
+
+Needs `curl` in the machine and `jq` on the Mac. Models are unloaded on exit.
+Exits 0 only when every check passes.
+USAGE
+}
+
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 2; }
+
+MACHINE=debian13-vm
+URL=http://192.168.64.1:8000
+MODEL=gemma4:e2b
+QAT_MODEL=gemma4:e2b-it-qat
+
+need_arg() { [[ $# -ge 2 && -n "$2" ]] || die "$1 needs a value"; }
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--machine)   need_arg "$@"; MACHINE="$2"; shift 2 ;;
+        -u|--url)       need_arg "$@"; URL="${2%/}"; shift 2 ;;
+        -m|--model)     need_arg "$@"; MODEL="$2"; shift 2 ;;
+        -q|--qat-model) need_arg "$@"; QAT_MODEL="$2"; shift 2 ;;
+        --no-qat)       QAT_MODEL=""; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+command -v container >/dev/null || die "container CLI not found in PATH"
+command -v jq >/dev/null || die "jq not found in PATH"
+[[ "$URL" != *"'"* ]] || die "URL must not contain a single quote"
+
+PASS=0
+FAIL=0
+pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS + 1)); }
+fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL + 1)); }
+step() { printf '\n\033[36m== %s\033[0m\n' "$*"; }
+
+# One argument: `machine run` joins its args and re-parses them with bash -c.
+vm() { container machine run -n "$MACHINE" -- "$1"; }
+
+# POST a JSON body from inside the VM. The body is single-quoted in the VM's
+# shell, so it must not contain a single quote.
+vm_post() {
+    local path="$1" body="$2" timeout="${3:-180}"
+    [[ "$body" != *"'"* ]] || die "request body must not contain a single quote"
+    vm "curl -sN -m $timeout -H 'Content-Type: application/json' '$URL$path' -d '$body'"
+}
+
+# The Mac reaches Ollama at the same URL: 192.168.64.1 is its own bridge address.
+unload() { curl -s -m 30 "$URL/api/generate" -d "$(jq -nc --arg m "$1" '{model: $m, keep_alive: 0}')" >/dev/null 2>&1 || true; }
+cleanup() {
+    unload "$MODEL"
+    [[ -z "$QAT_MODEL" ]] || unload "$QAT_MODEL"
+}
+trap cleanup EXIT
+
+gpu_check() {
+    local model="$1" sizes size vram
+    sizes="$(curl -s -m 10 "$URL/api/ps" | jq -r --arg m "$model" '.models[]? | select(.name == $m) | "\(.size) \(.size_vram)"' || true)"
+    if [[ -z "$sizes" ]]; then
+        fail "$model is not loaded according to $URL/api/ps"
+        return
+    fi
+    read -r size vram <<<"$sizes"
+    local gb pct=$((vram * 100 / size))
+    gb="$(awk -v s="$size" 'BEGIN { printf "%.1f", s / 1073741824 }')"
+    if [[ $pct -eq 100 ]]; then
+        pass "$model loaded 100% on the GPU (${gb} GB)"
+    else
+        fail "$model only ${pct}% on the GPU (${gb} GB)"
+    fi
+}
+
+generate_check() {
+    local model="$1" prompt="$2" body resp text
+    body="$(jq -nc --arg m "$model" --arg p "$prompt" '{model: $m, prompt: $p, stream: false, think: false, keep_alive: "60s"}')"
+    resp="$(vm_post /api/generate "$body" 240 || true)"
+    text="$(jq -r '.response // empty' <<<"$resp" 2>/dev/null || true)"
+    if [[ ${#text} -gt 5 ]]; then
+        jq -r '"  reply: \(.response | gsub("\n"; " "))\n  \(.eval_count) tokens @ \((.eval_count / (.eval_duration / 1e9)) * 10 | floor / 10) tok/s, load \((.load_duration / 1e9) * 10 | floor / 10) s"' <<<"$resp"
+        pass "$model answered through /api/generate"
+    else
+        fail "$model gave no text: $(head -c 200 <<<"$resp")"
+    fi
+}
+
+summary() {
+    echo
+    if [[ $FAIL -eq 0 ]]; then
+        printf '\033[32m%d passed, 0 failed\033[0m\n' "$PASS"
+    else
+        printf '\033[31m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
+    fi
+    [[ $FAIL -eq 0 ]]
+}
+
+step "0. machine ${MACHINE}"
+container machine inspect "$MACHINE" >/dev/null 2>&1 || die "no machine named ${MACHINE}"
+# A stopped machine boots on the first `machine run`, and refuses commands for a
+# few seconds while it does.
+for _ in $(seq 1 30); do
+    vm true >/dev/null 2>&1 && break
+    sleep 2
+done
+vm true >/dev/null 2>&1 || die "machine ${MACHINE} does not accept commands; check: container machine logs ${MACHINE}"
+vm "command -v curl >/dev/null" \
+    || die "curl is not installed in ${MACHINE}; run: container machine run -n ${MACHINE} --root -- 'apt-get update && apt-get install -y curl'"
+echo "  ready; testing against ${URL}"
+
+step "1. network path"
+out="$(vm "curl -s -m 5 -o /dev/null -w '%{http_code} %{time_connect}' '$URL/api/version'" || true)"
+if [[ "${out%% *}" == 200 ]]; then
+    pass "VM reaches ${URL} (connect ${out#* } s, Ollama $(vm "curl -s -m 5 '$URL/api/version'" | jq -r '.version // "?"'))"
+else
+    fail "no HTTP 200 from ${URL} (got '${out:-nothing}'); is Ollama listening on 0.0.0.0?"
+    summary || exit 1
+fi
+
+step "2. models"
+models="$(vm "curl -s -m 10 '$URL/v1/models'" | jq -r '[.data[]?.id] | join(" ")' || true)"
+echo "  ${models:-none}"
+if [[ " $models " == *" $MODEL "* ]]; then
+    pass "$MODEL is listed"
+else
+    fail "$MODEL is not listed; pull it on the Mac with: ollama pull $MODEL"
+fi
+
+step "3. native API"
+generate_check "$MODEL" "In one sentence, what is Debian?"
+
+step "4. streaming"
+body="$(jq -nc --arg m "$MODEL" '{model: $m, prompt: "Count from 1 to 5.", think: false, keep_alive: "60s"}')"
+stream="$(vm_post /api/generate "$body" 120 || true)"
+chunks="$(grep -c '"response"' <<<"$stream" || true)"
+echo "  ${chunks} chunks: $(jq -rj '.response // empty' <<<"$stream" 2>/dev/null | tr '\n' ' ' || true)"
+if [[ ${chunks:-0} -gt 3 ]]; then
+    pass "streaming delivers incremental chunks"
+else
+    fail "expected several streamed chunks, got ${chunks:-0}"
+fi
+
+step "5. OpenAI-compatible API"
+body="$(jq -nc --arg m "$MODEL" '{model: $m, messages: [{role: "system", content: "Answer briefly."}, {role: "user", content: "Which Debian package provides /sbin/init?"}], reasoning_effort: "none"}')"
+resp="$(vm_post /v1/chat/completions "$body" 120 || true)"
+text="$(jq -r '.choices[0].message.content // empty' <<<"$resp" 2>/dev/null || true)"
+if [[ -n "$text" ]]; then
+    jq -r '"  reply: \(.choices[0].message.content | gsub("\n"; " "))\n  finish=\(.choices[0].finish_reason) tokens=\(.usage.completion_tokens)"' <<<"$resp"
+    pass "/v1/chat/completions returned text"
+else
+    fail "no text from /v1/chat/completions: $(head -c 200 <<<"$resp")"
+fi
+
+step "6. GPU (asked from the Mac)"
+gpu_check "$MODEL"
+unload "$MODEL"
+sleep 3
+
+if [[ -n "$QAT_MODEL" ]]; then
+    step "7. second model: ${QAT_MODEL}"
+    generate_check "$QAT_MODEL" "In one sentence, why can a Linux VM on a Mac not use the GPU directly?"
+    gpu_check "$QAT_MODEL"
+fi
+
+summary

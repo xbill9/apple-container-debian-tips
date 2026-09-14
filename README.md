@@ -684,6 +684,59 @@ container machine run -n debian13-vm -- 'curl -s http://192.168.64.1:8000/v1/cha
 `ollama ps` on the Mac showed the model at `100% GPU` while the VM called it.
 Generation ran at about 45 tokens/s.
 
+### Automated test: `bin/test-vm-ollama`
+
+Runs the whole round trip from inside a machine and exits 0 only if every check
+passes. It checks:
+
+- the network path
+- the model list
+- the native API
+- streaming
+- the OpenAI-compatible API
+- 100% GPU placement (asked from the Mac through `/api/ps`)
+- a second model
+
+Models are unloaded on exit. It needs `curl` in the machine and `jq` on the Mac.
+
+```sh
+bin/test-vm-ollama                                  # debian13-vm, gemma4:e2b + gemma4:e2b-it-qat
+bin/test-vm-ollama -n dev-vm -m gemma4:e2b --no-qat
+bin/test-vm-ollama --url http://<other-host>:8000   # e.g. a llama.cpp/Ollama box elsewhere
+```
+
+Run on 2026-09-13 (26 s):
+
+```
+== 1. network path
+  PASS  VM reaches http://192.168.64.1:8000 (connect 0.002372 s, Ollama 0.33.3)
+== 2. models
+  gemma4:e2b-it-qat gemma4:e2b gemma4:e4b
+  PASS  gemma4:e2b is listed
+== 3. native API
+  reply: Debian is a free and open-source operating system that forms the basis for many other Linux distributions.
+  22 tokens @ 45.2 tok/s, load 5.4 s
+  PASS  gemma4:e2b answered through /api/generate
+== 4. streaming
+  14 chunks: 1, 2, 3, 4, 5
+  PASS  streaming delivers incremental chunks
+== 5. OpenAI-compatible API
+  PASS  /v1/chat/completions returned text
+== 6. GPU (asked from the Mac)
+  PASS  gemma4:e2b loaded 100% on the GPU (1.6 GB)
+== 7. second model: gemma4:e2b-it-qat
+  35 tokens @ 38.9 tok/s, load 12.4 s
+  PASS  gemma4:e2b-it-qat answered through /api/generate
+  PASS  gemma4:e2b-it-qat loaded 100% on the GPU (3.3 GB)
+
+8 passed, 0 failed
+```
+
+A wrong URL fails at step 1 (`no HTTP 200 ... is Ollama listening on 0.0.0.0?`)
+and exits 1. A missing machine, missing `curl` or a bad option exits 2.
+The GPU check reads `size_vram / size` from Ollama's `/api/ps`, the same numbers
+`ollama ps` prints as `100% GPU`.
+
 ### Gotcha: Gemma 4 thinks first, and an empty reply means it ran out of tokens
 
 Gemma 4 is a reasoning model. With a small token limit, the whole budget goes
