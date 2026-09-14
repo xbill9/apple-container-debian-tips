@@ -36,7 +36,8 @@ nine of them and a list of other machine images and Dockerfiles.
 
 ## 0. Prerequisites
 
-`container` is installed (README section 1) and its services are running:
+`container` is installed and its services are running. The full list is in
+[prerequisites.md](prerequisites.md):
 
 ```sh
 container system status                     # status  running

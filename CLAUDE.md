@@ -27,6 +27,7 @@ If a user needs an interactive shell, give them the command to run in a real ter
 - No `container commit` and no container→machine conversion; go through `container export` + a `FROM scratch` image.
 - No `container push` (`Plugin 'container-push' not found`) — it is `container image push [--scheme http] <ref>`.
 - `container machine create` returns before the VM accepts commands; a `machine run` right after it fails with the misleading error `Operation not supported by device` or `... on socket`. Poll `machine run -- true` first. After a restart, `machine run` works before systemd is up (`Failed to connect to system scope bus`); wait a few seconds before `systemctl`.
+- `docs/prerequisites.md` lists what the Mac needs (Apple silicon, macOS 26+, the signed `container` pkg, Homebrew tools, Ollama). `container` does not use Docker or containerd; its services are its own launchd agents. Update the doc when a script gains a dependency.
 - `docs/bootstrap-debian-machine.md` is the user-facing step-by-step guide; keep its commands and outputs in sync with README when behavior changes.
 - `docs/docker-hub-images.md` records dated boot tests of third-party images. Re-test (throwaway machines, `--cpus 1 --memory 1G`, at most ~3 at once on this 8 GB Mac) before changing its results. `readlink -f /sbin/init` prints a path even when init is missing; check with `ls`.
 - `machine create` takes `--cpus`/`--memory`/`--home-mount` directly; no `machine set` + restart needed.

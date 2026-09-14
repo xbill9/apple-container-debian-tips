@@ -6,10 +6,17 @@ verified on this machine.
 **Host:** Apple silicon (arm64), macOS 27.0 (build 26A428)
 **CLI:** `container` 1.4.1, installed to `/usr/local/bin/container`
 
-**Start here:** [docs/bootstrap-debian-machine.md](docs/bootstrap-debian-machine.md)
-is a step-by-step guide from a fresh official `debian:13` pull to a working
-machine, including why the official image cannot boot as one. The sections
-below are the detailed log behind it.
+**Start here:**
+
+1. [docs/prerequisites.md](docs/prerequisites.md): what the Mac needs before
+   any of this. It covers the hardware and macOS version, installing
+   `container` and what it runs (no Docker, no containerd), and the tools the
+   scripts use.
+2. [docs/bootstrap-debian-machine.md](docs/bootstrap-debian-machine.md): a
+   step-by-step guide from a fresh official `debian:13` pull to a working
+   machine, including why the official image cannot boot as one.
+
+The sections below are the detailed log behind both.
 
 ---
 
