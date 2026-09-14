@@ -46,7 +46,7 @@ If a user needs an interactive shell, give them the command to run in a real ter
 ## Local LLM (Ollama on the Mac, called from VMs)
 
 - VMs have no GPU. Ollama runs on macOS (Homebrew launchd service, `0.0.0.0:8000`) and VMs call `http://192.168.64.1:8000`. README section 15.
-- `bin/test-vm-ollama` is the end-to-end check (machine → Ollama → GPU). Run it after changing Ollama's config, the VM, or the script; it must exit 0.
+- Test in order: `bin/test-mac-ollama` (Ollama on the Mac: listener, localhost and 192.168.64.1, APIs, GPU), then `bin/test-vm-ollama` (machine → Ollama → GPU). Run both after changing Ollama's config, the VM, or either script; both must exit 0. If the Mac test passes and the VM test fails, look at the VM or network, not Ollama.
 - Restart Ollama with `launchctl bootout` + `bootstrap` of `~/Library/LaunchAgents/homebrew.mxcl.ollama.plist`, never `brew services restart` (it drops the custom `OLLAMA_HOST` and KV cache settings).
 - Gemma 4 reasons before answering: with a small `num_predict`/`max_tokens` the reply is empty (`done_reason`/`finish_reason: length`). Use `"think": false` (native) or `"reasoning_effort": "none"` (OpenAI API).
 - This Mac has 8 GB: load one model or engine at a time, and unload Ollama models with `{"model": "...", "keep_alive": 0}` when done.

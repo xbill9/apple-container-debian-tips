@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+#
+# test-mac-ollama — end-to-end test of Ollama on the Mac itself, before trying
+# it from a VM. If this passes and bin/test-vm-ollama fails, the problem is the
+# VM or the network path, not Ollama. See README section 15.
+
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+test-mac-ollama — test Ollama on the Mac before testing it from a VM
+
+USAGE:
+    test-mac-ollama [OPTIONS]
+
+OPTIONS:
+    -u, --url <url>          Ollama URL on the Mac (default: http://127.0.0.1:8000)
+        --vm-addr <ip>       The Mac's address on the VM network (default: 192.168.64.1)
+    -m, --model <model>      Model for the main checks (default: gemma4:e2b)
+    -q, --qat-model <model>  Second model to try (default: gemma4:e2b-it-qat)
+        --no-qat             Skip the second model
+    -h, --help               Show this help
+
+CHECKS:
+    1. something listens on the port, and it is Ollama; VMs need *:port, not 127.0.0.1
+    2. Ollama answers on the URL
+    3. Ollama answers on the VM-facing address (skipped if no VM network exists yet)
+    4. the launchd plist's OLLAMA_HOST (informational; `brew services restart` resets it)
+    5. the model is listed
+    6. native /api/generate returns text (thinking off)
+    7. streaming delivers incremental chunks
+    8. OpenAI-compatible /v1/chat/completions returns text
+    9. the model is loaded 100% on the GPU (/api/ps)
+   10. the second model answers and runs 100% on the GPU
+
+Needs curl and jq. Models are unloaded on exit. Exits 0 only when every check
+passes, 1 on a failed check, 2 on a setup error.
+USAGE
+}
+
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 2; }
+
+URL=http://127.0.0.1:8000
+VM_ADDR=192.168.64.1
+MODEL=gemma4:e2b
+QAT_MODEL=gemma4:e2b-it-qat
+PLIST="$HOME/Library/LaunchAgents/homebrew.mxcl.ollama.plist"
+
+need_arg() { [[ $# -ge 2 && -n "$2" ]] || die "$1 needs a value"; }
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u|--url)       need_arg "$@"; URL="${2%/}"; shift 2 ;;
+        --vm-addr)      need_arg "$@"; VM_ADDR="$2"; shift 2 ;;
+        -m|--model)     need_arg "$@"; MODEL="$2"; shift 2 ;;
+        -q|--qat-model) need_arg "$@"; QAT_MODEL="$2"; shift 2 ;;
+        --no-qat)       QAT_MODEL=""; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *)              die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+command -v curl >/dev/null || die "curl not found in PATH"
+command -v jq >/dev/null || die "jq not found in PATH"
+
+# http://127.0.0.1:8000 -> 8000; no explicit port -> Ollama's default 11434.
+PORT="${URL##*:}"
+[[ "$PORT" =~ ^[0-9]+$ ]] || PORT=11434
+
+PASS=0
+FAIL=0
+pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS + 1)); }
+fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL + 1)); }
+info() { printf '  \033[33minfo\033[0m  %s\n' "$*"; }
+step() { printf '\n\033[36m== %s\033[0m\n' "$*"; }
+
+post() { curl -sN -m "${3:-180}" -H 'Content-Type: application/json' "$URL$1" -d "$2"; }
+
+unload() { post /api/generate "$(jq -nc --arg m "$1" '{model: $m, keep_alive: 0}')" 30 >/dev/null 2>&1 || true; }
+cleanup() {
+    unload "$MODEL"
+    [[ -z "$QAT_MODEL" ]] || unload "$QAT_MODEL"
+}
+trap cleanup EXIT
+
+summary() {
+    echo
+    if [[ $FAIL -eq 0 ]]; then
+        printf '\033[32m%d passed, 0 failed\033[0m\n' "$PASS"
+        echo "Ollama works on the Mac. Next: bin/test-vm-ollama"
+    else
+        printf '\033[31m%d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
+    fi
+    [[ $FAIL -eq 0 ]]
+}
+
+gpu_check() {
+    local model="$1" sizes size vram gb pct
+    sizes="$(curl -s -m 10 "$URL/api/ps" | jq -r --arg m "$model" '.models[]? | select(.name == $m) | "\(.size) \(.size_vram)"' || true)"
+    if [[ -z "$sizes" ]]; then
+        fail "$model is not loaded according to /api/ps"
+        return
+    fi
+    read -r size vram <<<"$sizes"
+    pct=$((vram * 100 / size))
+    gb="$(awk -v s="$size" 'BEGIN { printf "%.1f", s / 1073741824 }')"
+    if [[ $pct -eq 100 ]]; then
+        pass "$model loaded 100% on the GPU (${gb} GB)"
+    else
+        fail "$model only ${pct}% on the GPU (${gb} GB); the rest is on the CPU, probably not enough free memory"
+    fi
+}
+
+generate_check() {
+    local model="$1" prompt="$2" resp text
+    resp="$(post /api/generate "$(jq -nc --arg m "$model" --arg p "$prompt" '{model: $m, prompt: $p, stream: false, think: false, keep_alive: "60s"}')" 240 || true)"
+    text="$(jq -r '.response // empty' <<<"$resp" 2>/dev/null || true)"
+    if [[ ${#text} -gt 5 ]]; then
+        jq -r '"  reply: \(.response | gsub("\n"; " "))\n  \(.eval_count) tokens @ \((.eval_count / (.eval_duration / 1e9)) * 10 | floor / 10) tok/s, load \((.load_duration / 1e9) * 10 | floor / 10) s"' <<<"$resp"
+        pass "$model answered through /api/generate"
+    else
+        fail "$model gave no text: $(head -c 200 <<<"$resp")"
+    fi
+}
+
+step "1. listener on port ${PORT}"
+listen="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $1, $9 }' | sort -u || true)"
+if [[ -z "$listen" ]]; then
+    fail "nothing listens on port ${PORT}; start Ollama: launchctl bootstrap gui/$(id -u) ${PLIST}"
+    summary || exit 1
+fi
+echo "  ${listen//$'\n'/, }"
+if ! grep -q '^ollama ' <<<"$listen"; then
+    fail "port ${PORT} is not held by ollama"
+elif grep -qE '^ollama (\*|0\.0\.0\.0|\[::\]):' <<<"$listen"; then
+    pass "ollama listens on all interfaces, so VMs can reach it"
+else
+    fail "ollama listens on localhost only; VMs cannot reach it. Set OLLAMA_HOST=0.0.0.0:${PORT} (README section 15)"
+fi
+
+step "2. HTTP on ${URL}"
+version="$(curl -s -m 5 "$URL/api/version" | jq -r '.version // empty' 2>/dev/null || true)"
+if [[ -n "$version" ]]; then
+    pass "Ollama ${version} answers on ${URL}"
+else
+    fail "no answer from ${URL}/api/version"
+    summary || exit 1
+fi
+
+step "3. VM-facing address ${VM_ADDR}"
+bridge="$(ifconfig 2>/dev/null | awk -v a="$VM_ADDR" '/^[a-z]/ { i = $1 } $1 == "inet" && $2 == a { sub(":", "", i); print i }' || true)"
+if [[ -z "$bridge" ]]; then
+    info "no interface has ${VM_ADDR} yet (it appears once a container or machine runs); skipped"
+else
+    code="$(curl -s -m 5 -o /dev/null -w '%{http_code}' "http://${VM_ADDR}:${PORT}/api/version" || true)"
+    if [[ "$code" == 200 ]]; then
+        pass "Ollama answers on http://${VM_ADDR}:${PORT} (${bridge}), the address VMs use"
+    else
+        fail "no answer on http://${VM_ADDR}:${PORT} (${bridge}, HTTP ${code:-none})"
+    fi
+fi
+
+step "4. launchd config"
+if [[ -f "$PLIST" ]]; then
+    host="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:OLLAMA_HOST' "$PLIST" 2>/dev/null || true)"
+    info "OLLAMA_HOST in plist: ${host:-unset (brew default: 127.0.0.1:11434)}"
+    [[ -n "$host" ]] || info "if \`brew services restart ollama\` regenerated the plist, set it again (README section 15)"
+else
+    info "no ${PLIST}; Ollama is not a Homebrew launchd service here"
+fi
+
+step "5. models"
+models="$(curl -s -m 10 "$URL/api/tags" | jq -r '[.models[]?.name] | join(" ")' || true)"
+echo "  ${models:-none}"
+if [[ " $models " == *" $MODEL "* ]]; then
+    pass "$MODEL is installed"
+else
+    fail "$MODEL is not installed; run: OLLAMA_HOST=127.0.0.1:${PORT} ollama pull $MODEL"
+fi
+
+step "6. native API"
+generate_check "$MODEL" "In one sentence, what is Debian?"
+
+step "7. streaming"
+stream="$(post /api/generate "$(jq -nc --arg m "$MODEL" '{model: $m, prompt: "Count from 1 to 5.", think: false, keep_alive: "60s"}')" 120 || true)"
+chunks="$(grep -c '"response"' <<<"$stream" || true)"
+echo "  ${chunks} chunks: $(jq -rj '.response // empty' <<<"$stream" 2>/dev/null | tr '\n' ' ' || true)"
+if [[ ${chunks:-0} -gt 3 ]]; then
+    pass "streaming delivers incremental chunks"
+else
+    fail "expected several streamed chunks, got ${chunks:-0}"
+fi
+
+step "8. OpenAI-compatible API"
+resp="$(post /v1/chat/completions "$(jq -nc --arg m "$MODEL" '{model: $m, messages: [{role: "system", content: "Answer briefly."}, {role: "user", content: "Which Debian package provides /sbin/init?"}], reasoning_effort: "none"}')" 120 || true)"
+text="$(jq -r '.choices[0].message.content // empty' <<<"$resp" 2>/dev/null || true)"
+if [[ -n "$text" ]]; then
+    jq -r '"  reply: \(.choices[0].message.content | gsub("\n"; " "))\n  finish=\(.choices[0].finish_reason) tokens=\(.usage.completion_tokens)"' <<<"$resp"
+    pass "/v1/chat/completions returned text"
+else
+    fail "no text from /v1/chat/completions: $(head -c 200 <<<"$resp")"
+fi
+
+step "9. GPU"
+gpu_check "$MODEL"
+unload "$MODEL"
+sleep 3
+
+if [[ -n "$QAT_MODEL" ]]; then
+    step "10. second model: ${QAT_MODEL}"
+    generate_check "$QAT_MODEL" "In one sentence, why can a Linux VM on a Mac not use the GPU directly?"
+    gpu_check "$QAT_MODEL"
+fi
+
+if command -v memory_pressure >/dev/null; then
+    info "memory free: $(memory_pressure | awk '/free percentage/ { print $NF }') (with ${QAT_MODEL:-no model} loaded)"
+fi
+
+summary

@@ -684,10 +684,68 @@ container machine run -n debian13-vm -- 'curl -s http://192.168.64.1:8000/v1/cha
 `ollama ps` on the Mac showed the model at `100% GPU` while the VM called it.
 Generation ran at about 45 tokens/s.
 
-### Automated test: `bin/test-vm-ollama`
+### Test on the Mac first: `bin/test-mac-ollama`
+
+Run this before involving a VM. If it passes and `bin/test-vm-ollama` fails,
+the problem is the VM or the network path, not Ollama. It checks:
+
+- what listens on the port. VMs need `*:8000`; `127.0.0.1:8000` fails with the fix.
+- Ollama answers on localhost, and on `192.168.64.1`, the address VMs use
+  (skipped until a container or machine has created `bridge100`)
+- the plist's `OLLAMA_HOST`, to spot a `brew services restart` reset
+- the model list
+- the native API, streaming and the OpenAI-compatible API
+- 100% GPU placement (`/api/ps`)
+- a second model
+
+Models are unloaded on exit. It exits 0 only when every check passes, 1 on a
+failed check, and 2 on a setup error.
+
+```sh
+bin/test-mac-ollama                      # http://127.0.0.1:8000, gemma4:e2b + gemma4:e2b-it-qat
+bin/test-mac-ollama -m gemma4:e2b --no-qat
+```
+
+Run on 2026-09-13 (20 s):
+
+```
+== 1. listener on port 8000
+  ollama *:8000
+  PASS  ollama listens on all interfaces, so VMs can reach it
+== 2. HTTP on http://127.0.0.1:8000
+  PASS  Ollama 0.33.3 answers on http://127.0.0.1:8000
+== 3. VM-facing address 192.168.64.1
+  PASS  Ollama answers on http://192.168.64.1:8000 (bridge100), the address VMs use
+== 4. launchd config
+  info  OLLAMA_HOST in plist: 0.0.0.0:8000
+== 5. models
+  PASS  gemma4:e2b is installed
+== 6. native API
+  23 tokens @ 43.6 tok/s, load 5.7 s
+  PASS  gemma4:e2b answered through /api/generate
+== 7. streaming
+  PASS  streaming delivers incremental chunks
+== 8. OpenAI-compatible API
+  PASS  /v1/chat/completions returned text
+== 9. GPU
+  PASS  gemma4:e2b loaded 100% on the GPU (1.6 GB)
+== 10. second model: gemma4:e2b-it-qat
+  33 tokens @ 43.3 tok/s, load 7.5 s
+  PASS  gemma4:e2b-it-qat answered through /api/generate
+  PASS  gemma4:e2b-it-qat loaded 100% on the GPU (3.3 GB)
+
+10 passed, 0 failed
+Ollama works on the Mac. Next: bin/test-vm-ollama
+```
+
+With nothing on the port, it stops at step 1 with
+`nothing listens on port 9999; start Ollama: launchctl bootstrap gui/501 ...`
+and exits 1.
+
+### Then from the VM: `bin/test-vm-ollama`
 
 Runs the whole round trip from inside a machine and exits 0 only if every check
-passes. It checks:
+passes. Run `bin/test-mac-ollama` first. It checks:
 
 - the network path
 - the model list
