@@ -414,9 +414,9 @@ Gemma 4 is a reasoning model. With a small token limit, the whole budget goes to
 
 | | Model | Quantization | Loaded | Speed |
 |---|---|---|---|---|
-| 🥇 | `gemma4:e2b` | Q4_K_M | 1.7 GB | ~44 tok/s |
+| 🥇 | `gemma4:e2b` | `Q4_K_M` | 1.7 GB | ~44 tok/s |
 | 🥈 | `gemma4:e2b-it-qat` | Q4_0, QAT (Google) | 3.6 GB | ~38–44 tok/s |
-| — | `gemma4:e4b` | Q4_K_M | not run | 9.6 GB on disk, more than this Mac's RAM |
+| — | `gemma4:e4b` | `Q4_K_M` | not run | 9.6 GB on disk, more than this Mac's RAM |
 
 `gemma4:e2b` is the comfortable choice. The QAT build is better quality at 4 bits, but free memory dropped to 6% with a machine running. When you are done, unload it rather than leaving 3.6 GB pinned:
 
