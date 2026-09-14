@@ -5,6 +5,7 @@ RUN apt-get update \
         systemd-sysv \
         dbus \
         ca-certificates \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # dbus writes a real /var/lib/dbus/machine-id at build time, and systemd copies

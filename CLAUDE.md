@@ -43,6 +43,14 @@ If a user needs an interactive shell, give them the command to run in a real ter
 - Any machine image that installs dbus must end with `: > /etc/machine-id && rm -f /var/lib/dbus/machine-id`, or systemd copies the build-time dbus ID into every machine.
 - `systemctl is-system-running` says `initializing` for several seconds after first boot; wait before judging it.
 
+## Local LLM (Ollama on the Mac, called from VMs)
+
+- VMs have no GPU. Ollama runs on macOS (Homebrew launchd service, `0.0.0.0:8000`) and VMs call `http://192.168.64.1:8000`. README section 15.
+- Restart Ollama with `launchctl bootout` + `bootstrap` of `~/Library/LaunchAgents/homebrew.mxcl.ollama.plist`, never `brew services restart` (it drops the custom `OLLAMA_HOST` and KV cache settings).
+- Gemma 4 reasons before answering: with a small `num_predict`/`max_tokens` the reply is empty (`done_reason`/`finish_reason: length`). Use `"think": false` (native) or `"reasoning_effort": "none"` (OpenAI API).
+- This Mac has 8 GB: load one model or engine at a time, and unload Ollama models with `{"model": "...", "keep_alive": 0}` when done.
+- The setup is deliberately open (demo): don't add firewall rules or rebind Ollama unless asked.
+
 ## Testing
 
 Claude may run real `container` builds and create/delete machines to test changes, but use throwaway names and clean up afterwards (see `/test-mkdebian-machine`). Do not touch the existing `debian13-vm` machine or `debian13-systemd` image. Never push to Docker Hub or any real registry without being asked — test `publish` against a local `registry:2` container on port 5050 with `--scheme http`.

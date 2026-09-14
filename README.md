@@ -230,7 +230,7 @@ Checked 2026-09-13 with `container ls -a`, `container machine ls`,
 
 | Thing | Name | Notes |
 |---|---|---|
-| Machine | `debian13-vm` | from `debian13-systemd`, running, the default, **2 CPUs / 2 GB** (not the 4 / 4 GB of section 3), home mounted rw |
+| Machine | `debian13-vm` | from `debian13-systemd`, running, the default, **2 CPUs / 2 GB** (not the 4 / 4 GB of section 3), home mounted rw, `curl` 8.14.1 installed |
 | Images | `debian13-systemd:latest`, `debian:13` | |
 | Containers | none of mine | the old `debian13` (`sleep infinity`) container is gone |
 | Builder | `buildkit` | stopped; `container build` starts it on demand |
@@ -239,6 +239,9 @@ Checked 2026-09-13 with `container ls -a`, `container machine ls`,
 | GUI | `~/AppleContainerDesktop` | Tauri app, built locally, unsigned |
 | MCP server | `~/AppleContainerMCP` | registered with Claude Code at user scope (section 13) |
 | shellcheck | 0.11.0, Homebrew | runs from this repo's Claude Code hook on edits to `bin/` |
+| Ollama | 0.33.3, Homebrew service on **`0.0.0.0:8000`** | `gemma4:e2b`, `gemma4:e2b-it-qat`, `gemma4:e4b`; VMs use `http://192.168.64.1:8000` (section 15) |
+| llama.cpp | 0.4.0, Homebrew (Metal) | `~/models/gguf/gemma-4-E2B_q4_0-it.gguf` (Google's QAT Q4_0) |
+| MLX | `mlx-lm` 0.31.3 via `uv tool run` | `mlx-community/gemma-4-E2B-it-qat-4bit` in `~/.cache/huggingface` |
 
 Shells:
 
@@ -597,3 +600,147 @@ container machine run -n t1 -- 'id; sudo -n true && echo sudo-ok'
 ```
 
 Or run `/test-mkdebian-machine` in Claude Code for the full round trip.
+
+---
+
+## 15. Using the Mac's GPU from a VM: local Ollama
+
+A VM gets no GPU. Linux inside `container` sees only virtual CPUs and virtual
+devices, with no Metal access. So the model runs on **macOS**, where Ollama
+uses the M3 GPU, and the VM calls it over the VM network. This is set up
+open on purpose; it is a demo.
+
+### How the VM reaches the Mac
+
+```
+debian13-vm  192.168.64.59        (changes on restart: it was .12 before)
+    │  default route + DNS → 192.168.64.1
+    ▼
+vmenet0 ─ bridge100 on the Mac  192.168.64.1   ← the Mac itself on the VM network
+    │
+Ollama  *:8000  →  Metal GPU
+```
+
+- `192.168.64.1` is the Mac's address on `bridge100`. It is the VM's gateway
+  and DNS server, and it did not change across VM restarts.
+- There is no `host.docker.internal` / `host.container.internal` name; use the IP.
+- No port forwarding: the VM connects straight to the Mac. That only works
+  because Ollama listens on all interfaces. On `127.0.0.1` the VM cannot
+  reach it.
+- No firewall rules are needed: the macOS application firewall is off, and the
+  VM has no `nft`, `iptables` or `ufw`. With `0.0.0.0` and no firewall, Ollama
+  is also reachable from the Wi-Fi network (checked at `<mac-wifi-ip>:8000`).
+
+### Mac side: point Ollama at all interfaces
+
+Ollama runs as a Homebrew launchd service. This Mac's plist had been customized
+to `OLLAMA_HOST=127.0.0.1:8000`, `OLLAMA_KV_CACHE_TYPE=q4_0` and
+`OLLAMA_FLASH_ATTENTION=1`. Changed only the host:
+
+```sh
+P=~/Library/LaunchAgents/homebrew.mxcl.ollama.plist
+cp -p "$P" "$P.bak-$(date +%Y%m%d%H%M%S)"
+/usr/libexec/PlistBuddy -c 'Set :EnvironmentVariables:OLLAMA_HOST 0.0.0.0:8000' "$P"
+
+# restart so launchd rereads the plist
+launchctl bootout gui/$(id -u)/homebrew.mxcl.ollama
+launchctl bootstrap gui/$(id -u) "$P"
+
+lsof -nP -iTCP:8000 -sTCP:LISTEN     # ollama  *:8000
+```
+
+**Do not use `brew services restart ollama`.** It regenerates the plist from
+the formula, which sets only `OLLAMA_FLASH_ATTENTION=1` and
+`OLLAMA_KV_CACHE_TYPE=q8_0`. That silently drops `OLLAMA_HOST` (back to
+localhost only) and the `q4_0` cache setting.
+
+### VM side: curl
+
+Debian images do not ship `curl`:
+
+```sh
+container machine run -n debian13-vm --root -- 'apt-get update && apt-get install -y --no-install-recommends curl ca-certificates'
+```
+
+(`build/Dockerfile.debian13-systemd` now includes `curl`, and
+`mkdebian-machine new` always has.)
+
+From the VM, verified 2026-09-13:
+
+```sh
+# models
+container machine run -n debian13-vm -- 'curl -s http://192.168.64.1:8000/v1/models'
+# {"data":[{"id":"gemma4:e2b-it-qat"},{"id":"gemma4:e2b"},{"id":"gemma4:e4b"}], ...}
+
+# Ollama native API
+container machine run -n debian13-vm -- 'curl -s http://192.168.64.1:8000/api/generate -d "{\"model\":\"gemma4:e2b\",\"prompt\":\"Say hello from a Debian VM in five words.\",\"stream\":false,\"think\":false}"'
+# "response":"Hello from Debian VM."
+
+# OpenAI-compatible API (base URL http://192.168.64.1:8000/v1)
+container machine run -n debian13-vm -- 'curl -s http://192.168.64.1:8000/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"gemma4:e2b\",\"messages\":[{\"role\":\"user\",\"content\":\"Name one Debian release codename.\"}],\"reasoning_effort\":\"none\"}"'
+# "content":"One Debian release codename is **Bookworm**."
+```
+
+`ollama ps` on the Mac showed the model at `100% GPU` while the VM called it.
+Generation ran at about 45 tokens/s.
+
+### Gotcha: Gemma 4 thinks first, and an empty reply means it ran out of tokens
+
+Gemma 4 is a reasoning model. With a small token limit, the whole budget goes
+to hidden reasoning and the answer comes back **empty**:
+
+| Request | Result |
+|---|---|
+| native, `num_predict: 40` | `"response":""`, `done_reason: length` |
+| OpenAI, `max_tokens: 20` | `"content":""`, `finish_reason: length`; `message.reasoning` starts `Thinking Process:` |
+| native, `"think": false` | `Hello from Debian VM.` in 6 tokens |
+| OpenAI, `"reasoning_effort": "none"` | an answer in 11 tokens |
+| OpenAI, no limit | `Bookworm`, but 159 tokens, mostly reasoning |
+
+Turn thinking off (`think: false` / `reasoning_effort: "none"`) for quick
+answers, or leave room for the reasoning.
+
+### Models on this Mac (M3, 8 GB)
+
+| Model | Quantization | Loaded | Speed | Notes |
+|---|---|---|---|---|
+| `gemma4:e2b` | Q4_K_M | 1.7 GB | ~44 tok/s | The comfortable choice for 8 GB |
+| `gemma4:e2b-it-qat` | Q4_0, QAT (Google) | 3.6 GB | ~38–44 tok/s | Better quality at 4 bits, but free memory dropped to 6% with `debian13-vm` running |
+| `gemma4:e4b` | Q4_K_M | not run | — | 9.6 GB on disk, more than this Mac's RAM |
+
+### Benchmark: Ollama vs llama.cpp vs MLX
+
+Same Gemma 4 E2B QAT weights in each engine, 512-token prompt, 128 generated
+tokens, 3 runs, one engine loaded at a time, on the Mac itself (not through a
+VM), with `debian13-vm` running:
+
+| Engine | Setup | Prompt tok/s | Generate tok/s | Memory |
+|---|---|---|---|---|
+| llama.cpp 0.4.0 (`llama-bench`) | `gemma-4-E2B_q4_0-it.gguf`, defaults (KV f16) | 671 | **47.6** | 3.1 GB weights |
+| llama.cpp 0.4.0 | same, Ollama's settings (flash attn, KV q4_0) | 652 | 42.8 | |
+| Ollama 0.33 (HTTP) | `gemma4:e2b-it-qat`, flash attn, KV q4_0 | 567 | 43.9 | 3.6 GB |
+| MLX, `mlx-lm` 0.31.3 (`mlx_lm.benchmark`) | `mlx-community/gemma-4-E2B-it-qat-4bit` | **1,857** | 39.5 | 3.9 GB peak |
+
+- **Generation** is within ~20% across engines. On an 8 GB M3 it is limited by
+  memory bandwidth more than by the engine. Ollama and llama.cpp are
+  essentially equal with the same settings; the `q4_0` KV cache costs about 10%.
+- **Prompt processing** is ~3× faster on MLX, which matters for long prompts.
+- Caveats: `llama-bench` and `mlx_lm.benchmark` use synthetic tokens, Ollama got
+  real text; the MLX 4-bit build comes from the same QAT source but is not
+  byte-identical to the GGUF; the Mac had ~3.9 GB of swap in use for all runs.
+- `/usr/bin/time -l` reports almost nothing for GPU memory on Apple silicon
+  (0.25 GB for llama.cpp); use each engine's own figure.
+- A first Ollama run was invalid: an identical warm-up prompt was served from
+  Ollama's prompt cache (16,587 "tok/s"), and a raw prompt stopped after 1
+  token. Vary the prompt per run and check `eval_count`.
+
+```sh
+# reproduce
+llama-bench -m ~/models/gguf/gemma-4-E2B_q4_0-it.gguf -p 512 -n 128 -r 3 -ngl 99
+uv tool run --from mlx-lm mlx_lm.benchmark --model mlx-community/gemma-4-E2B-it-qat-4bit -p 512 -g 128 -n 3
+```
+
+A CUDA build of llama.cpp cannot run on a Mac: CUDA is NVIDIA-only, and on Apple
+silicon llama.cpp uses Metal. A CUDA machine elsewhere on the network can serve
+the VM the same way, through `llama-server`'s OpenAI-compatible API (not tested
+from here).
