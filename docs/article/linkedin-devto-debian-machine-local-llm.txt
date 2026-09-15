@@ -1,0 +1,20 @@
+More Claude Code adventures.
+Can a Debian VM on a Mac use the Mac's GPU?
+
+Not directly. Apple's container CLI gives a Linux VM virtual CPUs and no Metal access. And the official debian:13 image will not even boot as a machine. It has no /sbin/init, and nothing on the command line tells you why.
+
+So split the work. Build a small Debian 13 image that boots, customize your app inside it like any Debian server, and run it with container machine run.
+
+The model stays on macOS. Ollama listens on the VM network, and the VM calls it at 192.168.64.1:8000 through the same OpenAI-compatible API any app already speaks.
+
+From inside Debian, Gemma 4 E2B answered at 45.2 tokens/s, loaded 100% on the M3 GPU.
+
+Write ups are here:
+
+dev.to:
+https://dev.to/gde/build-in-the-vm-think-on-the-mac-gpu-debian-13-on-apple-container-with-a-local-gemma-4-2d8b
+
+Source:
+https://github.com/xbill9/apple-container-debian-tips
+
+#debian #ollama #gemma #macos
